@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo.lock
+# Commit Cargo.lock for binaries, ignore for libraries
+Cargo.lock
+
+# IDEs
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
