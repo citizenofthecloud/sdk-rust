@@ -411,6 +411,124 @@ pub fn get_governance_feed(registry_url: &str) -> Result<Vec<serde_json::Value>>
     Ok(feed)
 }
 
+// ─── Registration (SDK token auth) ───────────────────────────
+
+/// Options for [`register_agent`].
+#[derive(Debug, Clone, Default)]
+pub struct RegisterOptions {
+    pub name: String,
+    pub declared_purpose: String,
+    /// 'tool' | 'assistant' | 'agent' | 'self-directing'. Defaults to "tool" if empty.
+    pub autonomy_level: String,
+    pub capabilities: Vec<String>,
+    pub operational_domain: Option<String>,
+    pub covenant_signed: bool,
+    /// Registry base URL. Defaults to [`DEFAULT_REGISTRY`] if empty.
+    pub registry_url: String,
+}
+
+/// Result returned by [`register_agent`]. The `private_key` is yours to
+/// keep — it is generated locally and never sent to the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResult {
+    pub cloud_id: String,
+    pub public_key: String,
+    pub private_key: String,
+    pub name: String,
+    pub declared_purpose: String,
+    pub autonomy_level: String,
+    #[serde(default)]
+    pub passport: Option<serde_json::Value>,
+}
+
+/// Register a new agent in a single call. Generates a fresh Ed25519 keypair
+/// locally, posts the public key plus the agent metadata to the registry
+/// under the supplied SDK token, and returns the cloud_id with both keys.
+///
+/// `sdk_token` must be a "cotc_sdk_*" token issued from the user's account
+/// at citizenofthecloud.com/account.
+pub fn register_agent(sdk_token: &str, opts: RegisterOptions) -> Result<RegisterResult> {
+    if !sdk_token.starts_with("cotc_sdk_") {
+        return Err(CloudError::SDKError(
+            "sdk_token must be a cotc_sdk_* token. Create one at citizenofthecloud.com/account.".into(),
+        ));
+    }
+
+    let autonomy_level = if opts.autonomy_level.is_empty() {
+        "tool".to_string()
+    } else {
+        opts.autonomy_level.clone()
+    };
+    let registry = if opts.registry_url.is_empty() {
+        DEFAULT_REGISTRY.to_string()
+    } else {
+        opts.registry_url.clone()
+    };
+
+    let kp = generate_key_pair()?;
+
+    let mut payload = serde_json::json!({
+        "name": opts.name,
+        "declared_purpose": opts.declared_purpose,
+        "autonomy_level": autonomy_level,
+        "public_key": kp.public_key,
+        "covenant_signed": opts.covenant_signed,
+        "capabilities": opts.capabilities,
+    });
+    if let Some(domain) = &opts.operational_domain {
+        payload["operational_domain"] = serde_json::Value::String(domain.clone());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let resp = client
+        .post(format!(
+            "{}/api/register",
+            registry.trim_end_matches('/')
+        ))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", sdk_token))
+        .body(payload.to_string())
+        .send()?;
+
+    let status = resp.status();
+    let body_text = resp.text()?;
+    if !status.is_success() {
+        let err_msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| v.get("error_code").and_then(|x| x.as_str()))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| format!("HTTP {}", status));
+        return Err(CloudError::RegistryError(format!(
+            "Registration failed: {}",
+            err_msg
+        )));
+    }
+
+    let data: serde_json::Value = serde_json::from_str(&body_text)?;
+    let cloud_id = data
+        .get("cloud_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CloudError::RegistryError("missing cloud_id in response".into()))?
+        .to_string();
+
+    Ok(RegisterResult {
+        cloud_id,
+        public_key: kp.public_key,
+        private_key: kp.private_key,
+        name: opts.name,
+        declared_purpose: opts.declared_purpose,
+        autonomy_level,
+        passport: data.get("passport").cloned(),
+    })
+}
+
 // ─── Cloud fetch (signed outbound) ───────────────────────────
 
 /// Make a signed HTTP request to another agent's endpoint. Auto-signs the
