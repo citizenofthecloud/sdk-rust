@@ -22,3 +22,11 @@ pem = "3"
 pkcs8 = { version = "0.10", features = ["ed25519", "alloc"] }
 thiserror = "1"
 urlencoding = "2"
+
+# Optional: axum HTTP middleware (enable with `--features axum`)
+axum = { version = "0.7", optional = true }
+http = { version = "1", optional = true }
+
+[features]
+default = []
+axum = ["dep:axum", "dep:http"]

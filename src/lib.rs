@@ -228,6 +228,8 @@ impl CloudIdentity {
 
     /// Generate request-bound authentication headers.
     /// Signature covers: {cloud_id}:{timestamp}:{method}:{url}:{body_hash}
+    /// Use this instead of `sign()` to bind the signature to a specific HTTP
+    /// request — prevents replay against different endpoints if headers leak.
     pub fn sign_request(&self, url: &str, method: &str, body: &str) -> SignedHeaders {
         let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let body_hash = Sha256::digest(body.as_bytes());
@@ -263,6 +265,196 @@ impl CloudIdentity {
         let agent: Agent = serde_json::from_value(agent_value.clone())?;
         Ok(agent)
     }
+
+    /// Prove this agent's identity via the full challenge/respond cryptographic
+    /// loop. Requests a nonce from the registry, signs it with the private key,
+    /// submits the response, and returns the verification result. The resulting
+    /// verification_log row is server-witnessed (authenticated=true) and
+    /// contributes to this agent's trust score.
+    pub fn prove_identity(&self) -> Result<VerificationResult> {
+        use base64::engine::general_purpose::STANDARD;
+        let challenge = request_challenge(&self.registry_url, &self.cloud_id)?;
+        // Server signs over the UTF-8 bytes of the hex nonce string (not the
+        // decoded hex bytes) — see registry's lib/verification.js.
+        let signature = self.signing_key.sign(challenge.nonce.as_bytes());
+        let sig_b64 = STANDARD.encode(signature.to_bytes());
+        submit_challenge_response(&self.registry_url, &self.cloud_id, &challenge.nonce, &sig_b64)
+    }
+}
+
+// ─── Challenge / Respond ─────────────────────────────────────
+
+/// Holds a nonce returned from `/api/verify/challenge`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChallengeResult {
+    pub nonce: String,
+    pub expires_in: u64,
+}
+
+/// Request a verification challenge for `cloud_id` from the registry. The
+/// returned nonce must be signed with the agent's private key (over the UTF-8
+/// bytes of the hex string) and submitted via `submit_challenge_response`.
+pub fn request_challenge(registry_url: &str, cloud_id: &str) -> Result<ChallengeResult> {
+    let url = format!("{}/api/verify/challenge", registry_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let body = serde_json::json!({ "cloud_id": cloud_id });
+    let resp = client.post(&url).json(&body).send()?;
+    let status = resp.status();
+    let text = resp.text()?;
+
+    if !status.is_success() {
+        if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(msg) = err_json.get("error").and_then(|v| v.as_str()) {
+                return Err(CloudError::RegistryError(msg.to_string()));
+            }
+        }
+        return Err(CloudError::RegistryError(format!(
+            "challenge request failed: {}",
+            status
+        )));
+    }
+
+    let result: ChallengeResult = serde_json::from_str(&text)?;
+    Ok(result)
+}
+
+/// Submit a signed challenge response. The registry validates the signature
+/// against the agent's registered public key and returns the verified agent.
+/// `signature` must be standard base64-encoded (not URL-safe).
+pub fn submit_challenge_response(
+    registry_url: &str,
+    cloud_id: &str,
+    nonce: &str,
+    signature: &str,
+) -> Result<VerificationResult> {
+    let url = format!("{}/api/verify/respond", registry_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let body = serde_json::json!({
+        "cloud_id": cloud_id,
+        "nonce": nonce,
+        "signature": signature,
+    });
+    let resp = client.post(&url).json(&body).send()?;
+    let text = resp.text()?;
+
+    // respond returns non-2xx for failed verification but still includes a
+    // parseable body — parse it as a VerificationResult either way.
+    let raw: serde_json::Value = serde_json::from_str(&text)?;
+    let verified = raw.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+    let reason = raw
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let timestamp = raw
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let agent = raw
+        .get("agent")
+        .and_then(|v| serde_json::from_value::<Agent>(v.clone()).ok());
+
+    Ok(VerificationResult {
+        verified,
+        reason,
+        agent,
+        timestamp,
+        latency_ms: 0.0,
+    })
+}
+
+// ─── Registry queries (no auth) ──────────────────────────────
+
+/// Look up an agent's public record by cloud_id.
+/// Returns `Ok(None)` if the agent is not found.
+pub fn lookup_agent(registry_url: &str, cloud_id: &str) -> Result<Option<Agent>> {
+    let url = format!(
+        "{}/api/verify?cloud_id={}",
+        registry_url.trim_end_matches('/'),
+        urlencoding::encode(cloud_id)
+    );
+    let data = fetch_json(&url)?;
+    if !data.get("verified").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let agent_value = match data.get("agent") {
+        Some(v) => v.clone(),
+        None => return Ok(None),
+    };
+    let agent: Agent = serde_json::from_value(agent_value)?;
+    Ok(Some(agent))
+}
+
+/// List the public agent directory.
+pub fn list_directory(registry_url: &str) -> Result<Vec<Agent>> {
+    let url = format!("{}/api/directory", registry_url.trim_end_matches('/'));
+    let data = fetch_json(&url)?;
+    let agents_value = data
+        .get("agents")
+        .ok_or_else(|| CloudError::RegistryError("no agents in response".to_string()))?;
+    let agents: Vec<Agent> = serde_json::from_value(agents_value.clone())?;
+    Ok(agents)
+}
+
+/// Get the governance activity feed.
+pub fn get_governance_feed(registry_url: &str) -> Result<Vec<serde_json::Value>> {
+    let url = format!("{}/api/governance/feed", registry_url.trim_end_matches('/'));
+    let data = fetch_json(&url)?;
+    let feed = data
+        .get("feed")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(feed)
+}
+
+// ─── Cloud fetch (signed outbound) ───────────────────────────
+
+/// Make a signed HTTP request to another agent's endpoint. Auto-signs the
+/// request with the given identity's key. Returns the reqwest::blocking::Response
+/// so the caller can read the body and status.
+pub fn cloud_fetch(
+    identity: &CloudIdentity,
+    url: &str,
+    method: &str,
+    body: &str,
+) -> Result<reqwest::blocking::Response> {
+    let headers = identity.sign_request(url, method, body);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let method_upper = method.to_uppercase();
+    let mut req = match method_upper.as_str() {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        "PATCH" => client.patch(url),
+        _ => {
+            return Err(CloudError::SDKError(format!(
+                "unsupported HTTP method: {}",
+                method
+            )))
+        }
+    };
+
+    req = req
+        .header("X-Cloud-ID", &headers.cloud_id)
+        .header("X-Cloud-Timestamp", &headers.timestamp)
+        .header("X-Cloud-Signature", &headers.signature)
+        .header("X-Cloud-Request-Bound", "true");
+
+    if !body.is_empty() {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+    }
+
+    Ok(req.send()?)
 }
 
 // ─── Trust Policy ────────────────────────────────────────────
@@ -653,6 +845,142 @@ fn verify_agent_inner(
     }
 }
 
+/// Verify incoming request headers with request-bound signature validation.
+///
+/// Validates the signature over `{cloud_id}:{timestamp}:{method}:{url}:{body_hash}`
+/// (stricter than `verify_agent` which only validates `{cloud_id}:{timestamp}`).
+/// Use this on routes where you want to bind signatures to a specific request
+/// and prevent replay against different endpoints if headers leak.
+///
+/// Falls back to `verify_agent` if the request does not carry the
+/// `X-Cloud-Request-Bound` marker.
+pub fn verify_request(
+    headers: &HashMap<String, String>,
+    url: &str,
+    method: &str,
+    body: &str,
+    policy: Option<&TrustPolicy>,
+) -> VerificationResult {
+    let start = Instant::now();
+
+    let get = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .or_else(|| headers.get(&name.to_lowercase()))
+            .cloned()
+    };
+
+    if get("X-Cloud-Request-Bound").is_none() {
+        return verify_agent(headers, policy);
+    }
+
+    // Run policy + lookup via verify_agent. If it fails for any reason other
+    // than signature mismatch, return that result — only the signature is
+    // expected to fail (because verify_agent uses the simple-payload signature).
+    let basic = verify_agent(headers, policy);
+    if !basic.verified && basic.reason.as_deref() != Some("invalid_signature") {
+        return basic;
+    }
+
+    let agent = match basic.agent {
+        Some(a) => a,
+        None => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_cloud_id".to_string()),
+                agent: None,
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+
+    let (cloud_id, timestamp, signature) = match (
+        get("X-Cloud-ID"),
+        get("X-Cloud-Timestamp"),
+        get("X-Cloud-Signature"),
+    ) {
+        (Some(c), Some(t), Some(s)) => (c, t, s),
+        _ => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("missing_headers".to_string()),
+                agent: Some(agent),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+
+    let verifying_key = match parse_public_key(&agent.public_key) {
+        Ok(k) => k,
+        Err(_) => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_signature".to_string()),
+                agent: Some(agent),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+
+    let body_hash = Sha256::digest(body.as_bytes());
+    let body_hash_b64 = URL_SAFE_NO_PAD.encode(body_hash);
+    let payload = format!(
+        "{}:{}:{}:{}:{}",
+        cloud_id,
+        timestamp,
+        method.to_uppercase(),
+        url,
+        body_hash_b64
+    );
+
+    let sig_bytes = match URL_SAFE_NO_PAD.decode(&signature) {
+        Ok(b) => b,
+        Err(_) => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_signature".to_string()),
+                agent: Some(agent),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+
+    let sig = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_signature".to_string()),
+                agent: Some(agent),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+
+    if verifying_key.verify(payload.as_bytes(), &sig).is_err() {
+        return VerificationResult {
+            verified: false,
+            reason: Some("invalid_signature".to_string()),
+            agent: Some(agent),
+            timestamp: None,
+            latency_ms: ms(start),
+        };
+    }
+
+    VerificationResult {
+        verified: true,
+        reason: None,
+        agent: Some(agent),
+        timestamp: Some(timestamp),
+        latency_ms: ms(start),
+    }
+}
+
 // ─── Logging ─────────────────────────────────────────────────
 
 fn log_verification(
@@ -752,4 +1080,114 @@ fn fetch_json(url: &str) -> Result<serde_json::Value> {
     let text = resp.text()?;
     let data: serde_json::Value = serde_json::from_str(&text)?;
     Ok(data)
+}
+
+// ─── Axum middleware (feature-gated) ─────────────────────────
+//
+// Enable with `--features axum` in your Cargo.toml:
+//   citizenofthecloud = { version = "...", features = ["axum"] }
+//
+// Then use `cloud_guard` as an axum middleware layer to verify inbound
+// Cloud-signed requests before they reach your handler. The verified
+// Agent is attached to the request's extensions so the handler can pull
+// it out with `Extension<Agent>`.
+
+#[cfg(feature = "axum")]
+pub mod axum_middleware {
+    use super::{verify_agent, Agent, TrustPolicy};
+    use axum::{
+        body::Body,
+        extract::Request,
+        http::{HeaderMap, StatusCode},
+        middleware::Next,
+        response::{IntoResponse, Response},
+    };
+    use std::collections::HashMap;
+
+    /// Axum middleware that verifies inbound Cloud-signed requests.
+    ///
+    /// On success, attaches the verified `Agent` to request extensions.
+    /// On failure, responds with 401 and a JSON error body.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use axum::{Router, middleware, routing::get};
+    /// use citizenofthecloud::axum_middleware::cloud_guard;
+    ///
+    /// let app: Router = Router::new()
+    ///     .route("/protected", get(handler))
+    ///     .layer(middleware::from_fn(cloud_guard));
+    /// ```
+    pub async fn cloud_guard(mut req: Request, next: Next) -> Response {
+        let headers_map = headers_to_map(req.headers());
+        let result = verify_agent(&headers_map, None);
+
+        if !result.verified {
+            let reason = result.reason.unwrap_or_else(|| "unauthorized".to_string());
+            let body = format!(r#"{{"error":"{}"}}"#, reason);
+            return (
+                StatusCode::UNAUTHORIZED,
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response();
+        }
+
+        if let Some(agent) = result.agent {
+            req.extensions_mut().insert(agent);
+        }
+
+        next.run(req).await
+    }
+
+    /// Axum middleware with a custom `TrustPolicy`.
+    ///
+    /// Returns a closure suitable for `middleware::from_fn_with_state` or
+    /// `middleware::from_fn` after partial application.
+    pub fn cloud_guard_with_policy(
+        policy: TrustPolicy,
+    ) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+           + Clone {
+        move |mut req: Request, next: Next| {
+            let policy = policy.clone();
+            Box::pin(async move {
+                let headers_map = headers_to_map(req.headers());
+                let result = verify_agent(&headers_map, Some(&policy));
+
+                if !result.verified {
+                    let reason = result.reason.unwrap_or_else(|| "unauthorized".to_string());
+                    let body = format!(r#"{{"error":"{}"}}"#, reason);
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                        .into_response();
+                }
+
+                if let Some(agent) = result.agent {
+                    req.extensions_mut().insert(agent);
+                }
+
+                next.run(req).await
+            })
+        }
+    }
+
+    fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
+    // Suppress unused-import warning when `Body` isn't directly referenced
+    // in the middleware bodies above.
+    #[allow(dead_code)]
+    type _BodyMarker = Body;
 }
