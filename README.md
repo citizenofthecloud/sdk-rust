@@ -6,14 +6,52 @@ Identity and authentication for autonomous AI agents. Rust SDK.
 
 ## Install
 
-Add to `Cargo.toml`:
+This SDK is currently distributed directly from GitHub. The crates.io release is not yet caught up with the latest features (most recently: `register_agent()` and SDK-token auth). For now, reference the GitHub repo directly in `Cargo.toml`:
 
 ```toml
 [dependencies]
-citizenofthecloud = "0.1.0"
+citizenofthecloud = { git = "https://github.com/citizenofthecloud/sdk-rust" }
 ```
 
+Optional feature for Axum HTTP middleware:
+
+```toml
+[dependencies]
+citizenofthecloud = { git = "https://github.com/citizenofthecloud/sdk-rust", features = ["axum"] }
+```
+
+A crates.io release will follow once the API stabilizes.
+
 ## Quick Start
+
+### Register a new agent (one-time setup)
+
+Bootstrap a new Cloud Identity agent in a single call. Generates a fresh Ed25519 keypair locally, posts the public key to the registry under your SDK token, and returns the `cloud_id` together with both keys. The private key never leaves your process — store it securely.
+
+Get an SDK token from [citizenofthecloud.com/account](https://citizenofthecloud.com/account).
+
+```rust
+use citizenofthecloud::{register_agent, RegisterOptions};
+
+fn main() {
+    let result = register_agent(
+        &std::env::var("COTC_SDK_TOKEN").unwrap(),
+        RegisterOptions {
+            name: "My Research Bot".to_string(),
+            declared_purpose: "Summarize papers and surface trends".to_string(),
+            autonomy_level: "tool".to_string(),
+            covenant_signed: true,
+            ..Default::default()
+        },
+    ).unwrap();
+
+    println!("{}", result.cloud_id);
+    println!("{}", result.public_key);
+    println!("{}", result.private_key);   // STORE SECURELY — the server keeps only the public key
+}
+```
+
+The returned `cloud_id` and `private_key` are the inputs to `CloudIdentity` for signing subsequent requests.
 
 ### Sign outbound requests
 
@@ -71,15 +109,23 @@ let policy = TrustPolicy {
 let result = verify_agent(&headers, Some(&policy));
 ```
 
-### Generate keys for registration
+### Generate keys without registering
 
 ```rust
 use citizenofthecloud::generate_key_pair;
 
 let keys = generate_key_pair().unwrap();
-println!("{}", keys.public_key);   // Submit during registration
+println!("{}", keys.public_key);   // Submit during manual registration
 println!("{}", keys.private_key);  // Keep secret
 ```
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `CLOUD_ID` | Your agent's Cloud ID (e.g., `cc-7f3a9b2e-...`) |
+| `CLOUD_PRIVATE_KEY` | Your agent's Ed25519 private key (PEM format) |
+| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) for `register_agent()`. Obtain from [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
 
 ## Features
 
@@ -90,6 +136,13 @@ println!("{}", keys.private_key);  // Keep secret
 - Trust policy enforcement (trust score, autonomy level, blocklist)
 - Fire-and-forget verification logging
 - Thread-safe cache
+- Optional Axum middleware (feature-gated)
+
+## Links
+
+- [Citizen of the Cloud](https://citizenofthecloud.com)
+- [SDK Documentation](https://citizenofthecloud.com/docs)
+- [Account / SDK tokens](https://citizenofthecloud.com/account)
 
 ## License
 
