@@ -6,7 +6,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```no_run
 //! use citizenofthecloud::{CloudIdentity, Config, verify_agent, generate_key_pair};
 //!
 //! // Generate keys
@@ -20,10 +20,10 @@
 //! }).unwrap();
 //!
 //! // Sign outbound requests
-//! let headers = identity.sign();
+//! let headers = identity.sign().to_map();
 //!
 //! // Verify inbound requests
-//! let result = verify_agent(&headers_map, None);
+//! let result = verify_agent(&headers, None);
 //! ```
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -79,7 +79,9 @@ pub struct Agent {
     pub trust_score: Option<f64>,
     pub registration_date: Option<String>,
     pub last_verified: Option<String>,
-    pub public_key: String,
+    // Optional because /api/directory redacts the public key for listings;
+    // /api/verify (single-agent lookup) and registration responses include it.
+    pub public_key: Option<String>,
     pub owner_username: Option<String>,
 }
 
@@ -900,7 +902,19 @@ fn verify_agent_inner(
     }
 
     // 9. Verify cryptographic signature
-    let verifying_key = match parse_public_key(&agent_data.public_key) {
+    let pk = match agent_data.public_key.as_deref() {
+        Some(s) => s,
+        None => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_signature".to_string()),
+                agent: Some(agent_data),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+    let verifying_key = match parse_public_key(pk) {
         Ok(k) => k,
         Err(_) => {
             return VerificationResult {
@@ -1030,7 +1044,19 @@ pub fn verify_request(
         }
     };
 
-    let verifying_key = match parse_public_key(&agent.public_key) {
+    let pk = match agent.public_key.as_deref() {
+        Some(s) => s,
+        None => {
+            return VerificationResult {
+                verified: false,
+                reason: Some("invalid_signature".to_string()),
+                agent: Some(agent),
+                timestamp: None,
+                latency_ms: ms(start),
+            }
+        }
+    };
+    let verifying_key = match parse_public_key(pk) {
         Ok(k) => k,
         Err(_) => {
             return VerificationResult {
@@ -1212,7 +1238,7 @@ fn fetch_json(url: &str) -> Result<serde_json::Value> {
 
 #[cfg(feature = "axum")]
 pub mod axum_middleware {
-    use super::{verify_agent, Agent, TrustPolicy};
+    use super::{verify_agent, TrustPolicy};
     use axum::{
         body::Body,
         extract::Request,
@@ -1238,7 +1264,22 @@ pub mod axum_middleware {
     /// ```
     pub async fn cloud_guard(mut req: Request, next: Next) -> Response {
         let headers_map = headers_to_map(req.headers());
-        let result = verify_agent(&headers_map, None);
+        // verify_agent uses reqwest::blocking internally; running it directly
+        // inside an async handler panics (nested-runtime). Hand it to a
+        // blocking thread so axum workers stay non-blocking.
+        let result = match tokio::task::spawn_blocking(move || verify_agent(&headers_map, None))
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    r#"{"error":"verify_join_error"}"#,
+                )
+                    .into_response();
+            }
+        };
 
         if !result.verified {
             let reason = result.reason.unwrap_or_else(|| "unauthorized".to_string());
@@ -1270,7 +1311,21 @@ pub mod axum_middleware {
             let policy = policy.clone();
             Box::pin(async move {
                 let headers_map = headers_to_map(req.headers());
-                let result = verify_agent(&headers_map, Some(&policy));
+                let result = match tokio::task::spawn_blocking(move || {
+                    verify_agent(&headers_map, Some(&policy))
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("content-type", "application/json")],
+                            r#"{"error":"verify_join_error"}"#,
+                        )
+                            .into_response();
+                    }
+                };
 
                 if !result.verified {
                     let reason = result.reason.unwrap_or_else(|| "unauthorized".to_string());
