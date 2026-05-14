@@ -1,148 +1,247 @@
-# citizenofthecloud
+# citizenofthecloud — Rust SDK
 
 Identity and authentication for autonomous AI agents. Rust SDK.
 
 **Prove who you are. Verify who you're talking to.**
 
+Exposes the full **17-tool Citizen of the Cloud surface** — registration, signing, verification, the challenge/respond loop, registry queries, and an Axum route-guard middleware (behind the `axum` feature flag).
+
+---
+
 ## Install
 
-This SDK is currently distributed directly from GitHub. The crates.io release is not yet caught up with the latest features (most recently: `register_agent()` and SDK-token auth). For now, reference the GitHub repo directly in `Cargo.toml`:
-
 ```toml
+# Cargo.toml — directly from GitHub (recommended while crates.io catches up)
 [dependencies]
-citizenofthecloud = { git = "https://github.com/citizenofthecloud/sdk-rust" }
+citizenofthecloud = { git = "https://github.com/citizenofthecloud/sdk-rust", branch = "main" }
+
+# With the Axum route-guard middleware enabled:
+citizenofthecloud = { git = "...", features = ["axum"] }
 ```
-
-Optional feature for Axum HTTP middleware:
-
-```toml
-[dependencies]
-citizenofthecloud = { git = "https://github.com/citizenofthecloud/sdk-rust", features = ["axum"] }
-```
-
-A crates.io release will follow once the API stabilizes.
-
-## Quick Start
-
-### Register a new agent (one-time setup)
-
-Bootstrap a new Cloud Identity agent in a single call. Generates a fresh Ed25519 keypair locally, posts the public key to the registry under your SDK token, and returns the `cloud_id` together with both keys. The private key never leaves your process — store it securely.
-
-Get an SDK token from [citizenofthecloud.com/account](https://citizenofthecloud.com/account).
 
 ```rust
-use citizenofthecloud::{register_agent, RegisterOptions};
+use citizenofthecloud as cotc;
+```
 
-fn main() {
-    let result = register_agent(
-        &std::env::var("COTC_SDK_TOKEN").unwrap(),
-        RegisterOptions {
-            name: "My Research Bot".to_string(),
-            declared_purpose: "Summarize papers and surface trends".to_string(),
-            autonomy_level: "tool".to_string(),
-            covenant_signed: true,
+Requires Rust 1.75+.
+
+---
+
+## The 17-tool surface
+
+| # | Tool | API | Purpose |
+|---|---|---|---|
+| 1 | lookup-agent | `cotc::lookup_agent(registry_url, cloud_id)` | Read another agent's passport |
+| 2 | get-server-identity | `identity.get_passport()` | Fetch your own passport |
+| 3 | list-directory | `cotc::list_directory(registry_url)` | Browse the public directory |
+| 4 | governance-feed | `cotc::get_governance_feed(registry_url)` | Read recent registry events |
+| 5 | verify-agent | `cotc::verify_agent(headers, &policy)` | Verify signed headers (simple) |
+| 6 | verify-request | `cotc::verify_request(headers, url, method, body, &policy)` | Verify request-bound signature |
+| 7 | request-challenge | `cotc::request_challenge(registry_url, cloud_id)` | Ask the registry for a nonce |
+| 8 | respond-to-challenge | `cotc::submit_challenge_response(...)` | Submit a signed nonce |
+| 9 | prove-identity | `identity.prove_identity()` | Full challenge/sign/respond loop |
+| 10 | sign-headers | `identity.sign()` | Produce timestamp-bound headers |
+| 11 | sign-request | `identity.sign_request(url, method, body)` | Produce request-bound headers |
+| 12 | cloud-fetch | `cotc::cloud_fetch(&identity, url, method, body)` | Auto-signed HTTP request |
+| 13 | generate-keypair | `cotc::generate_key_pair()` | Make a fresh Ed25519 keypair |
+| 14 | trust-policy | `cotc::TrustPolicy { .. }` | Reusable verification rules |
+| 15 | clear-cache | `cotc::clear_cache()` | Clear the verification cache |
+| 16 | http-middleware | `cotc::axum::cloud_guard(policy)` (feature `axum`) | Axum route guard |
+| 17 | register-agent | `cotc::register_agent(sdk_token, opts)` | Programmatic agent registration |
+
+---
+
+## Quick start (register → sign → verify)
+
+```rust
+use citizenofthecloud as cotc;
+use std::env;
+
+fn main() -> cotc::Result<()> {
+    // 1. Register a new agent (one-time; needs an SDK token from /account)
+    let reg = cotc::register_agent(
+        &env::var("COTC_SDK_TOKEN").unwrap(),
+        cotc::RegisterOptions {
+            name: "My Research Bot".into(),
+            declared_purpose: "Summarize papers and surface trends".into(),
+            autonomy_level: "tool".into(),
             ..Default::default()
         },
-    ).unwrap();
+    )?;
+    println!("Cloud ID: {}", reg.cloud_id);
+    println!("Private key — STORE SECURELY:\n{}", reg.private_key);
 
-    println!("{}", result.cloud_id);
-    println!("{}", result.public_key);
-    println!("{}", result.private_key);   // STORE SECURELY — the server keeps only the public key
-}
-```
+    // 2. Sign an outbound request
+    let me = cotc::CloudIdentity::new(cotc::Config {
+        cloud_id: reg.cloud_id.clone(),
+        private_key: reg.private_key.clone(),
+        ..Default::default()
+    })?;
+    let headers = me.sign()?;
+    // attach headers to your reqwest / ureq / hyper request...
 
-The returned `cloud_id` and `private_key` are the inputs to `CloudIdentity` for signing subsequent requests.
-
-### Sign outbound requests
-
-```rust
-use citizenofthecloud::{CloudIdentity, Config};
-
-let identity = CloudIdentity::new(Config {
-    cloud_id: std::env::var("CLOUD_ID").unwrap(),
-    private_key: std::env::var("CLOUD_PRIVATE_KEY").unwrap(),
-    registry_url: None,
-}).unwrap();
-
-let headers = identity.sign();
-
-// Use with reqwest
-let client = reqwest::blocking::Client::new();
-let mut req = client.post("https://other-agent.com/api/task");
-for (k, v) in headers.to_map() {
-    req = req.header(k, v);
-}
-let resp = req.send().unwrap();
-```
-
-### Verify inbound requests
-
-```rust
-use citizenofthecloud::verify_agent;
-use std::collections::HashMap;
-
-fn handle_request(headers: &HashMap<String, String>) {
-    let result = verify_agent(headers, None);
-
+    // 3. On the receiving side — verify an inbound request
+    let policy = cotc::TrustPolicy { minimum_trust_score: Some(0.5), ..Default::default() };
+    let result = cotc::verify_agent(&inbound_headers, &policy)?;
     if result.verified {
-        let agent = result.agent.unwrap();
-        println!("Verified: {}", agent.name);
-        println!("Trust: {:?}", agent.trust_score);
-    } else {
-        println!("Rejected: {:?}", result.reason);
+        println!("Verified: {} (trust {:?})", result.agent.unwrap().name, result.agent.unwrap().trust_score);
     }
+    Ok(())
 }
 ```
 
-### With Trust Policy
+---
+
+## Examples per surface
+
+### Key management (#13 generate-keypair)
 
 ```rust
-use citizenofthecloud::{verify_agent, TrustPolicy};
+let keys = cotc::generate_key_pair()?;
+// keys.public_key  → submit during manual registration
+// keys.private_key → keep secret
+```
 
-let policy = TrustPolicy {
-    minimum_trust_score: Some(0.7),
-    allowed_autonomy_levels: Some(vec!["agent".to_string(), "assistant".to_string()]),
-    blocked_agents: Some(vec!["cc-known-bad-actor".to_string()]),
+### Registration (#17 register-agent)
+
+```rust
+let reg = cotc::register_agent(
+    &env::var("COTC_SDK_TOKEN").unwrap(),
+    cotc::RegisterOptions {
+        name: "My Research Bot".into(),
+        declared_purpose: "Summarize papers and surface trends".into(),
+        autonomy_level: "tool".into(),    // "tool" | "assistant" | "agent" | "self-directing"
+        capabilities: Some(vec!["summarize".into(), "cite".into()]),
+        operational_domain: Some("research-lab.example.com".into()),
+        ..Default::default()
+    },
+)?;
+```
+
+### Outbound signing (#10, #11, #12)
+
+```rust
+let me = cotc::CloudIdentity::new(cotc::Config {
+    cloud_id: env::var("CLOUD_ID")?,
+    private_key: env::var("CLOUD_PRIVATE_KEY")?,
+    ..Default::default()
+})?;
+
+// 10 — simple
+let headers = me.sign()?;
+
+// 11 — request-bound (signs URL + method + body hash too)
+let req_headers = me.sign_request("https://other.example.com/api/data", "POST", r#"{"q":"x"}"#)?;
+
+// 12 — convenience: HTTP call with auto-signed request-bound headers
+let resp = cotc::cloud_fetch(&me, "https://other.example.com/api/data", "POST", Some(r#"{"q":"x"}"#))?;
+```
+
+### Inbound verification (#5, #6, #14)
+
+```rust
+let policy = cotc::TrustPolicy {
+    minimum_trust_score: Some(0.5),
+    require_covenant: true,
+    allowed_autonomy_levels: Some(vec!["agent".into(), "assistant".into()]),
     ..Default::default()
 };
 
-let result = verify_agent(&headers, Some(&policy));
+// 5 — simple
+let r1 = cotc::verify_agent(&headers, &policy)?;
+
+// 6 — request-bound
+let r2 = cotc::verify_request(&headers, &request_url, request_method, &body_str, &policy)?;
+
+if !r2.verified {
+    return Err(/* 401 */);
+}
+println!("Verified {}", r2.agent.unwrap().name);
 ```
 
-### Generate keys without registering
+### Challenge / Respond (#7, #8, #9 prove-identity)
 
 ```rust
-use citizenofthecloud::generate_key_pair;
+let me = cotc::CloudIdentity::new(cotc::Config { cloud_id, private_key, ..Default::default() })?;
 
-let keys = generate_key_pair().unwrap();
-println!("{}", keys.public_key);   // Submit during manual registration
-println!("{}", keys.private_key);  // Keep secret
+// 9 — full self-prove loop in one call (recommended)
+let verified = me.prove_identity()?;
+assert!(verified.verified);
+
+// Or — compose manually:
+// 7
+let ch = cotc::request_challenge("https://citizenofthecloud.com", &cloud_id)?;
+// 8 — pass your base64 signature over the UTF-8 nonce bytes
+let result = cotc::submit_challenge_response(
+    "https://citizenofthecloud.com", &cloud_id, &ch.nonce, &signature_b64,
+)?;
 ```
 
-## Environment Variables
+### Registry queries (#1, #2, #3, #4)
+
+```rust
+// 1 — Look up another agent
+let agent = cotc::lookup_agent("https://citizenofthecloud.com", "cc-abc...")?;
+
+// 2 — Fetch your own passport
+let me = cotc::CloudIdentity::new(cotc::Config { cloud_id, private_key, ..Default::default() })?;
+let my = me.get_passport()?;
+
+// 3 — Browse the public directory
+let all = cotc::list_directory("https://citizenofthecloud.com")?;
+
+// 4 — Read the governance event feed
+let feed = cotc::get_governance_feed("https://citizenofthecloud.com")?;
+```
+
+### Axum route guard (#16 http-middleware, feature `axum`)
+
+Enable the feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+citizenofthecloud = { git = "...", features = ["axum"] }
+```
+
+```rust
+use axum::{Router, routing::post};
+use citizenofthecloud::axum::cloud_guard;
+use citizenofthecloud::TrustPolicy;
+
+let app = Router::new()
+    .route("/api/task", post(handler))
+    .layer(cloud_guard(TrustPolicy {
+        minimum_trust_score: Some(0.5),
+        ..Default::default()
+    }));
+```
+
+### Cache control (#15 clear-cache)
+
+```rust
+cotc::clear_cache();   // useful in tests / after a trust-score update
+```
+
+---
+
+## Environment variables
 
 | Variable | Description |
 |---|---|
 | `CLOUD_ID` | Your agent's Cloud ID (e.g., `cc-7f3a9b2e-...`) |
 | `CLOUD_PRIVATE_KEY` | Your agent's Ed25519 private key (PEM format) |
-| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) for `register_agent()`. Obtain from [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
+| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) for `register_agent`. Get one at [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
 
-## Features
-
-- Ed25519 cryptographic signatures
-- Header-based authentication (compatible with all HTTP clients)
-- Request-bound signatures (method + URL + body hash)
-- In-memory public key caching with TTL
-- Trust policy enforcement (trust score, autonomy level, blocklist)
-- Fire-and-forget verification logging
-- Thread-safe cache
-- Optional Axum middleware (feature-gated)
+---
 
 ## Links
 
-- [Citizen of the Cloud](https://citizenofthecloud.com)
-- [SDK Documentation](https://citizenofthecloud.com/docs)
+- [citizenofthecloud.com](https://citizenofthecloud.com)
+- [Documentation](https://citizenofthecloud.com/docs)
+- [Specification](https://citizenofthecloud.com/spec)
 - [Account / SDK tokens](https://citizenofthecloud.com/account)
+- Sister SDKs: [sdk-js](https://github.com/citizenofthecloud/sdk-js) · [sdk-python](https://github.com/citizenofthecloud/sdk-python) · [sdk-go](https://github.com/citizenofthecloud/sdk-go)
+- [MCP server](https://github.com/citizenofthecloud/mcp-server)
 
 ## License
 
