@@ -83,6 +83,36 @@ pub struct Agent {
     // /api/verify (single-agent lookup) and registration responses include it.
     pub public_key: Option<String>,
     pub owner_username: Option<String>,
+    // None indicates the agent has not yet appeared in a refresh of the
+    // Layer 3 materialized view. Treat None as "not enough data yet,"
+    // not as "zero across all signals."
+    #[serde(default)]
+    pub reputation: Option<Reputation>,
+}
+
+/// Layer 3 component signals exposed alongside the composite `trust_score`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reputation {
+    #[serde(default)]
+    pub verifications_30d: u64,
+    #[serde(default)]
+    pub lifetime_verifications: u64,
+    #[serde(default)]
+    pub success_rate_30d: f64,
+    #[serde(default)]
+    pub success_rate_lifetime: f64,
+    #[serde(default)]
+    pub reports_filed: u64,
+    #[serde(default)]
+    pub reports_upheld: u64,
+    #[serde(default)]
+    pub reports_dismissed: u64,
+    #[serde(default)]
+    pub authenticated_proofs: u64,
+    #[serde(default)]
+    pub account_age_days: u64,
+    pub first_seen: Option<String>,
+    pub last_verified_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]

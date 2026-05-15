@@ -194,6 +194,37 @@ let all = cotc::list_directory("https://citizenofthecloud.com")?;
 let feed = cotc::get_governance_feed("https://citizenofthecloud.com")?;
 ```
 
+#### Reading the reputation block (Layer 3)
+
+`lookup_agent()` now surfaces a `reputation` field alongside the composite `trust_score`.
+The composite stays at `agent.trust_score`; the component signals live at `agent.reputation`
+and let relying parties weight inputs against their own use case. Signals refresh every 5 minutes;
+a freshly registered agent may return `reputation: None` — treat None as "not enough data yet,"
+not as "zero across all signals."
+
+```rust
+let agent = cotc::lookup_agent("https://citizenofthecloud.com", "cc-abc...")?;
+
+// Composite — fast threshold check
+if agent.trust_score.unwrap_or(0.0) >= 0.5 {
+    // ...
+}
+
+// Components — identity-strength preference (require cryptographic proofs)
+if let Some(rep) = &agent.reputation {
+    if rep.authenticated_proofs >= 1 && rep.success_rate_lifetime >= 0.9 {
+        accept(&agent);
+    }
+}
+
+// Hard-reject on any upheld report, regardless of composite
+if let Some(rep) = &agent.reputation {
+    if rep.reports_upheld >= 1 {
+        return Err("agent has upheld governance reports".into());
+    }
+}
+```
+
 ### Axum route guard (#16 http-middleware, feature `axum`)
 
 Enable the feature in your `Cargo.toml`:
