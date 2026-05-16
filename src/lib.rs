@@ -36,7 +36,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = "0.1.0";
-pub const DEFAULT_REGISTRY: &str = "https://citizenofthecloud.com";
+// Canonical host is www. The bare apex 307-redirects here, and reqwest
+// strips the Authorization header on cross-host redirects — so callers
+// using the bare apex silently fail register_agent (and any future
+// auth-bearing endpoint) with a 401.
+pub const DEFAULT_REGISTRY: &str = "https://www.citizenofthecloud.com";
 pub const DEFAULT_MAX_AGE: u64 = 300; // 5 minutes in seconds
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
